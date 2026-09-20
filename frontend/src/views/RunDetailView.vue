@@ -6,7 +6,11 @@
         <p class="muted" style="margin-top: 0">
           {{ run.project }} ·
           <n-tag size="small" :type="statusType">{{ statusLabel }}</n-tag>
-          · version {{ run.version }}
+          ·
+          <span :style="health && health.state !== 'aligned' ? 'color:#d03050;font-weight:700' : ''">
+            投影 v{{ run.version }}
+          </span>
+          / 事件 v{{ health ? health.event_version : '…' }}
         </p>
       </div>
       <div style="display: flex; gap: 8px">
@@ -14,6 +18,40 @@
         <n-button @click="$router.push(`/runs/${run.id}/lineage`)">血缘</n-button>
       </div>
     </div>
+
+    <n-alert
+      v-if="health && health.state !== 'aligned'"
+      type="error"
+      class="health-alert"
+      :show-icon="true"
+      title="投影滞后于 event_store"
+    >
+      <div>
+        事件最高 <strong>v{{ health.event_version }}</strong>，投影仅
+        <strong>v{{ health.projection_version }}</strong>
+        （落后 {{ health.lag }} 个事件{{ health.state === 'corrupt' ? '，版本异常' : '' }}）。当前详情与血缘是旧数据，事件时间线为准。
+      </div>
+      <template #action>
+        <n-button
+          v-if="auth.role === 'researcher'"
+          size="small"
+          type="warning"
+          :loading="rebuilding"
+          @click="confirmRebuild"
+        >
+          按 event_store 全量重建投影
+        </n-button>
+        <span v-else class="muted" style="font-size: 12px">审计员只读，请由研究员重建</span>
+      </template>
+    </n-alert>
+    <n-alert
+      v-else-if="health"
+      type="success"
+      class="health-alert"
+      :show-icon="false"
+    >
+      投影与事件流已对齐：均为 v{{ health.event_version }}
+    </n-alert>
 
     <div class="card" style="margin-bottom: 16px">
       <div class="grid-2">
@@ -94,26 +132,53 @@
     </div>
     <div v-else class="card muted">审计员只读：可查看事件与血缘，不可发送命令。</div>
   </div>
+
+  <div class="page" v-else-if="missing">
+    <n-result status="warning" title="该 Run 的投影缺失" :description="`event_store 中仍有事件，但读模型投影已被清空。可查看事件时间线，或${
+      auth.role === 'researcher' ? '由研究员重建投影。' : '请研究员重建投影。'
+    }`">
+      <template #footer>
+        <n-space>
+          <n-button @click="$router.push(`/runs/${route.params.id}/events`)">查看事件时间线</n-button>
+          <n-button
+            v-if="auth.role === 'researcher'"
+            type="warning"
+            :loading="rebuilding"
+            @click="confirmRebuildMissing"
+          >
+            按 event_store 全量重建投影
+          </n-button>
+          <n-button @click="$router.push('/projection-health')">前往投影健康页</n-button>
+        </n-space>
+      </template>
+    </n-result>
+  </div>
 </template>
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { useMessage } from 'naive-ui'
+import { useDialog, useMessage } from 'naive-ui'
 import {
   abortRun,
   attachArtifact,
   completeRun,
   getRun,
+  getRunProjectionHealth,
   recordMetric,
+  rebuildProjection,
 } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 
 const route = useRoute()
 const auth = useAuthStore()
 const message = useMessage()
+const dialog = useDialog()
 const run = ref(null)
+const health = ref(null)
+const missing = ref(false)
 const busy = ref(false)
+const rebuilding = ref(false)
 const completeSummary = ref('')
 const abortReason = ref('')
 
@@ -156,7 +221,59 @@ function randomHex(n) {
 }
 
 async function load() {
-  run.value = await getRun(route.params.id)
+  missing.value = false
+  health.value = null
+  try {
+    run.value = await getRun(route.params.id)
+  } catch (e) {
+    if (e.response?.status === 404) {
+      run.value = null
+      missing.value = true
+    } else {
+      throw e
+    }
+  }
+  try {
+    health.value = await getRunProjectionHealth(route.params.id)
+  } catch {
+    // 健康信息加载失败不阻塞详情渲染
+  }
+}
+
+function confirmRebuild() {
+  const h = health.value
+  dialog.warning({
+    title: '重建投影',
+    content: `将读取 event_store 全量重放并覆盖当前投影（事件 v${h.event_version}，投影 v${h.projection_version}）。事件流不会被修改。是否继续？`,
+    positiveText: '重建',
+    negativeText: '取消',
+    onPositiveClick: doRebuild,
+  })
+}
+
+function confirmRebuildMissing() {
+  dialog.warning({
+    title: '重建投影',
+    content: '投影当前缺失，将读取 event_store 全量重放以恢复读模型。事件流不会被修改。是否继续？',
+    positiveText: '重建',
+    negativeText: '取消',
+    onPositiveClick: doRebuild,
+  })
+}
+
+async function doRebuild() {
+  rebuilding.value = true
+  try {
+    const result = await rebuildProjection(route.params.id)
+    message.success(
+      `重建完成：重放 ${result.replayed_events} 个事件，事件 v${result.event_version} = 投影 v${result.projection_version}`,
+    )
+    await load()
+  } catch (e) {
+    message.error(e.message || '重建失败')
+  } finally {
+    rebuilding.value = false
+  }
 }
 
 async function withBusy(fn) {
@@ -231,3 +348,9 @@ onMounted(async () => {
   }
 })
 </script>
+
+<style scoped>
+.health-alert {
+  margin: 12px 0 16px;
+}
+</style>

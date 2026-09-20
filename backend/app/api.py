@@ -9,9 +9,12 @@ from app.cqrs import (
     ConflictError,
     DomainError,
     abort_run,
+    all_projection_health,
     attach_artifact,
     complete_run,
     list_events,
+    projection_health,
+    rebuild_run_projection,
     record_metric,
     start_run,
 )
@@ -24,6 +27,8 @@ from app.schemas import (
     EventOut,
     LineageOut,
     LoginRequest,
+    ProjectionHealthOut,
+    RebuildResultOut,
     RecordMetricCommand,
     RunOut,
     StartRunCommand,
@@ -207,7 +212,7 @@ def get_lineage(
 ):
     proj = db.get(RunProjection, run_id)
     if not proj:
-        raise HTTPException(status_code=404, detail="Run 不存在")
+        raise HTTPException(status_code=404, detail="Run 不存在（投影缺失，可在投影健康页重建）")
     return LineageOut(
         run_id=proj.id,
         project=proj.project,
@@ -223,4 +228,49 @@ def get_lineage(
         finished_at=proj.finished_at,
         started_by=proj.started_by,
         version=proj.version,
+    )
+
+
+@router.get("/projection-health", response_model=list[ProjectionHealthOut])
+def get_all_projection_health(
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    """全部 Run 的投影健康：以 event_store 为基准，投影清空/滞后都可见。"""
+    return all_projection_health(db)
+
+
+@router.get("/runs/{run_id}/projection-health", response_model=ProjectionHealthOut)
+def get_run_projection_health(
+    run_id: UUID,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    try:
+        return projection_health(db, run_id)
+    except DomainError as exc:
+        _handle_domain(exc)
+
+
+@router.post("/runs/{run_id}/rebuild", response_model=RebuildResultOut)
+def post_rebuild_projection(
+    run_id: UUID,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_researcher),
+):
+    """按 event_store 全量重放重建该 Run 投影（仅研究员，审计员只读）。"""
+    try:
+        proj = rebuild_run_projection(db, run_id)
+        after = projection_health(db, run_id)
+        replayed = len(list_events(db, run_id))
+    except DomainError as exc:
+        _handle_domain(exc)
+    return RebuildResultOut(
+        run_id=run_id,
+        event_version=after["event_version"],
+        projection_version=after["projection_version"],
+        lag=after["lag"],
+        state=after["state"],
+        replayed_events=replayed,
+        run=RunOut.model_validate(proj),
     )

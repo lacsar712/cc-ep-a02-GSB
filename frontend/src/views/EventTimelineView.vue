@@ -12,7 +12,25 @@
     </div>
 
     <div class="card">
-      <n-timeline v-if="events.length">
+      <n-alert
+        v-if="health"
+        :type="health.state === 'aligned' ? 'success' : 'error'"
+        class="health-alert"
+        :show-icon="true"
+        :title="
+          health.state === 'aligned'
+            ? `投影已对齐：事件与投影均为 v${health.event_version}`
+            : `投影${health.state === 'missing' ? '缺失' : '滞后'}：事件最高 v${health.event_version}，投影 ${
+                health.state === 'missing' ? '缺失' : `v${health.projection_version}`
+              }（落后 ${health.lag}）`
+        "
+      >
+        <template #action>
+          <n-button size="small" @click="$router.push('/projection-health')">前往投影健康</n-button>
+        </template>
+      </n-alert>
+
+      <n-timeline v-if="events.length" style="margin-top: 12px">
         <n-timeline-item
           v-for="ev in events"
           :key="ev.id"
@@ -35,11 +53,12 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useMessage } from 'naive-ui'
-import { getEvents } from '../api/client'
+import { getEvents, getRunProjectionHealth } from '../api/client'
 
 const route = useRoute()
 const message = useMessage()
 const events = ref([])
+const health = ref(null)
 const loading = ref(true)
 const id = computed(() => route.params.id)
 
@@ -56,11 +75,21 @@ function itemType(t) {
 
 onMounted(async () => {
   try {
-    events.value = await getEvents(id.value)
-  } catch (e) {
-    message.error(e.message || '加载失败')
+    const [evs, h] = await Promise.allSettled([
+      getEvents(id.value),
+      getRunProjectionHealth(id.value),
+    ])
+    if (evs.status === 'fulfilled') events.value = evs.value
+    else message.error(evs.reason?.message || '加载失败')
+    if (h.status === 'fulfilled') health.value = h.value
   } finally {
     loading.value = false
   }
 })
 </script>
+
+<style scoped>
+.health-alert {
+  margin-bottom: 4px;
+}
+</style>

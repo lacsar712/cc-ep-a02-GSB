@@ -98,3 +98,25 @@ class LineageOut(BaseModel):
     finished_at: datetime | None
     started_by: str
     version: int
+
+
+class ProjectionHealthOut(BaseModel):
+    run_id: UUID
+    name: str | None
+    project: str | None
+    event_version: int
+    projection_version: int
+    lag: int
+    state: str  # aligned | lagging | missing | corrupt
+
+    model_config = {"from_attributes": True}
+
+
+class RebuildResultOut(BaseModel):
+    run_id: UUID
+    event_version: int
+    projection_version: int
+    lag: int
+    state: str
+    replayed_events: int
+    run: RunOut

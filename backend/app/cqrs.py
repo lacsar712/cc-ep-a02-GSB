@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -12,6 +12,12 @@ from app.models import EventStore, RunProjection
 
 
 TERMINAL_STATUSES = {"completed", "aborted"}
+
+# 投影相对 event_store 的健康状态
+STATE_ALIGNED = "aligned"
+STATE_LAGGING = "lagging"
+STATE_MISSING = "missing"
+STATE_CORRUPT = "corrupt"
 
 
 class DomainError(Exception):
@@ -317,3 +323,95 @@ def rebuild_projection_from_events(db: Session, run_id: UUID) -> RunProjection |
     for event in events:
         proj = _apply_event_to_projection(proj, event)
     return proj
+
+
+def _latest_event_version(db: Session, run_id: UUID) -> int:
+    return db.scalar(select(func.max(EventStore.version)).where(EventStore.aggregate_id == run_id)) or 0
+
+
+def projection_health(db: Session, run_id: UUID) -> dict[str, Any]:
+    """对比某 Run 在 event_store 的最高 version 与投影 version。"""
+    event_version = _latest_event_version(db, run_id)
+    proj = db.get(RunProjection, run_id)
+    projection_version = proj.version if proj is not None else 0
+
+    if event_version == 0:
+        raise DomainError("Run 不存在：event_store 中没有该聚合的事件", status_code=404)
+
+    if proj is None:
+        state = STATE_MISSING
+    elif proj.version > event_version:
+        # 投影版本不应超过事件流，出现即说明数据损坏
+        state = STATE_CORRUPT
+    elif proj.version < event_version:
+        state = STATE_LAGGING
+    else:
+        state = STATE_ALIGNED
+
+    return {
+        "run_id": run_id,
+        "name": proj.name if proj is not None else None,
+        "project": proj.project if proj is not None else None,
+        "event_version": event_version,
+        "projection_version": projection_version,
+        "lag": event_version - projection_version,
+        "state": state,
+    }
+
+
+def rebuild_run_projection(db: Session, run_id: UUID) -> RunProjection:
+    """按 event_store 全量重放，删除旧投影后重建并落库。"""
+    events = list_events(db, run_id)
+    if not events:
+        raise DomainError("Run 不存在：event_store 中没有该聚合的事件", status_code=404)
+
+    # 清空该 Run 的旧投影（可能滞后或整行缺失），再从事件全量重放
+    db.execute(delete(RunProjection).where(RunProjection.id == run_id))
+    db.flush()
+
+    proj: RunProjection | None = None
+    for event in events:
+        proj = _apply_event_to_projection(proj, event)
+    assert proj is not None  # events 非空，重放必然产出投影
+    db.add(proj)
+    db.commit()
+    db.refresh(proj)
+    return proj
+
+
+def all_projection_health(db: Session) -> list[dict[str, Any]]:
+    """聚合：以 event_store 中的全部 Run 为基准（投影被清空也不会漏掉）。"""
+    stmt = (
+        select(
+            EventStore.aggregate_id,
+            func.max(EventStore.version),
+        )
+        .group_by(EventStore.aggregate_id)
+    )
+    rows = list(db.execute(stmt).all())
+
+    result: list[dict[str, Any]] = []
+    for aggregate_id, event_version in rows:
+        proj = db.get(RunProjection, aggregate_id)
+        projection_version = proj.version if proj is not None else 0
+        if proj is None:
+            state = STATE_MISSING
+        elif proj.version > event_version:
+            state = STATE_CORRUPT
+        elif proj.version < event_version:
+            state = STATE_LAGGING
+        else:
+            state = STATE_ALIGNED
+        result.append(
+            {
+                "run_id": aggregate_id,
+                "name": proj.name if proj is not None else None,
+                "project": proj.project if proj is not None else None,
+                "event_version": event_version,
+                "projection_version": projection_version,
+                "lag": event_version - projection_version,
+                "state": state,
+            }
+        )
+    result.sort(key=lambda h: (h["state"] == STATE_ALIGNED, -(h["lag"])))
+    return result
