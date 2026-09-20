@@ -77,4 +77,19 @@ export async function getLineage(id) {
   return data
 }
 
+export async function listProjectionHealth() {
+  const { data } = await api.get('/projection-health')
+  return data
+}
+
+export async function getProjectionHealth(id) {
+  const { data } = await api.get(`/runs/${id}/projection-health`)
+  return data
+}
+
+export async function rebuildProjection(id) {
+  const { data } = await api.post(`/runs/${id}/rebuild`)
+  return data
+}
+
 export default api

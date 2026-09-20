@@ -64,6 +64,12 @@ pytest -q
 6. 打开「血缘」确认 code_commit、dataset 指纹、artifacts、metrics
 7. 健康检查：`GET http://localhost:8173/api/health`
 8. 用 `auditor` 登录：可看列表/事件/血缘，命令按钮不可用
+9. 投影健康（导航「投影健康」/ `/projection-health`）：以 event_store 最高 version 为基准，
+   展示每个 Run 的事件最高 version 与投影 version；滞后或投影缺失会红色醒目提示。
+   研究员可点「按事件重放重建」（`POST /api/runs/{id}/rebuild`），审计员只读（接口返回 403）。
+   可手动制造滞后验收：
+   `docker compose exec db psql -U provenance -d provenance -c "update run_projections set version=version-1 where id='11111111-1111-1111-1111-111111111111';"`
+   或清空：`delete from run_projections where id='...';` —— 页面提示滞后/缺失，重建后 version 对齐且详情/血缘恢复可读。
 
 终态或 `expected_version` 不匹配时，API 返回 **409**。
 
@@ -73,3 +79,6 @@ pytest -q
 - **事件**：`RunStarted` / `MetricRecorded` / `ArtifactAttached` / `RunCompleted` / `RunAborted`
 - **event_store**：`(aggregate_id, version)` 唯一；冲突 → 409
 - **run_projections**：查询侧投影（状态、指标、产物等）
+- **投影健康与重建**：`GET /api/projection-health`（全员可读）对比
+  `max(event_store.version)` 与投影 version；`POST /api/runs/{id}/rebuild` 仅研究员可调用，
+  按 event_store 全量重放、删除并替换该 Run 的投影行，不写入任何新事件（不是通用运维入口，仅服务于 Run 投影）

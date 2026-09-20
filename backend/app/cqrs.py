@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -317,3 +318,91 @@ def rebuild_projection_from_events(db: Session, run_id: UUID) -> RunProjection |
     for event in events:
         proj = _apply_event_to_projection(proj, event)
     return proj
+
+
+@dataclass
+class ProjectionHealth:
+    run_id: UUID | None
+    project: str | None
+    name: str | None
+    projection_present: bool
+    projection_version: int
+    event_version: int
+    lag: int
+    healthy: bool
+
+
+def _event_max_version(db: Session, run_id: UUID) -> int:
+    value = db.scalar(
+        select(func.max(EventStore.version)).where(EventStore.aggregate_id == run_id)
+    )
+    return int(value or 0)
+
+
+def get_projection_health(db: Session, run_id: UUID) -> ProjectionHealth | None:
+    """对比 event_store 最高 version 与投影 version。
+
+    投影行缺失（被清空）时投影 version 视为 0，仍然可以从事件侧识别该 Run。
+    """
+    event_version = _event_max_version(db, run_id)
+    if event_version == 0:
+        return None
+    proj = _get_projection(db, run_id)
+    projection_version = proj.version if proj is not None else 0
+    lag = event_version - projection_version
+    return ProjectionHealth(
+        run_id=run_id,
+        project=proj.project if proj else None,
+        name=proj.name if proj else None,
+        projection_present=proj is not None,
+        projection_version=projection_version,
+        event_version=event_version,
+        lag=lag,
+        healthy=(lag == 0 and proj is not None),
+    )
+
+
+def list_projection_health(db: Session) -> list[ProjectionHealth]:
+    """全量投影健康：以 event_store 中的聚合为准，投影缺失/滞后都能被发现。"""
+    agg_rows = db.execute(
+        select(EventStore.aggregate_id, func.max(EventStore.version))
+        .group_by(EventStore.aggregate_id)
+    ).all()
+    result: list[ProjectionHealth] = []
+    for aggregate_id, event_version in agg_rows:
+        proj = _get_projection(db, aggregate_id)
+        projection_version = proj.version if proj is not None else 0
+        lag = int(event_version) - projection_version
+        result.append(
+            ProjectionHealth(
+                run_id=aggregate_id,
+                project=proj.project if proj else None,
+                name=proj.name if proj else None,
+                projection_present=proj is not None,
+                projection_version=projection_version,
+                event_version=int(event_version),
+                lag=lag,
+                healthy=(lag == 0 and proj is not None),
+            )
+        )
+    result.sort(key=lambda h: (h.healthy, -(h.lag), str(h.run_id)))
+    return result
+
+
+def rebuild_and_persist_projection(db: Session, run_id: UUID) -> RunProjection:
+    """按 event_store 全量重放并落库替换投影（支持投影被清空后的恢复）。
+
+    只动查询侧 run_projections，绝不追加/修改 event_store。
+    """
+    rebuilt = rebuild_projection_from_events(db, run_id)
+    if rebuilt is None:
+        raise DomainError("event_store 中不存在该 Run 的事件，无法重建投影", status_code=404)
+
+    existing = db.get(RunProjection, run_id)
+    if existing is not None:
+        db.delete(existing)
+        db.flush()
+    db.add(rebuilt)
+    db.commit()
+    db.refresh(rebuilt)
+    return rebuilt

@@ -98,3 +98,14 @@ class LineageOut(BaseModel):
     finished_at: datetime | None
     started_by: str
     version: int
+
+
+class ProjectionHealthOut(BaseModel):
+    run_id: UUID
+    project: str | None
+    name: str | None
+    projection_present: bool
+    projection_version: int
+    event_version: int
+    lag: int
+    healthy: bool

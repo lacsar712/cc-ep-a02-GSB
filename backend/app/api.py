@@ -11,7 +11,10 @@ from app.cqrs import (
     abort_run,
     attach_artifact,
     complete_run,
+    get_projection_health,
     list_events,
+    list_projection_health,
+    rebuild_and_persist_projection,
     record_metric,
     start_run,
 )
@@ -24,6 +27,7 @@ from app.schemas import (
     EventOut,
     LineageOut,
     LoginRequest,
+    ProjectionHealthOut,
     RecordMetricCommand,
     RunOut,
     StartRunCommand,
@@ -207,7 +211,7 @@ def get_lineage(
 ):
     proj = db.get(RunProjection, run_id)
     if not proj:
-        raise HTTPException(status_code=404, detail="Run 不存在")
+        raise HTTPException(status_code=404, detail="投影缺失：请先按 event_store 重建投影")
     return LineageOut(
         run_id=proj.id,
         project=proj.project,
@@ -224,3 +228,37 @@ def get_lineage(
         started_by=proj.started_by,
         version=proj.version,
     )
+
+
+@router.get("/projection-health", response_model=list[ProjectionHealthOut])
+def get_all_projection_health(
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    """以 event_store 为准列出每个 Run 的投影滞后情况（审计员只读可看）。"""
+    return list_projection_health(db)
+
+
+@router.get("/runs/{run_id}/projection-health", response_model=ProjectionHealthOut)
+def get_run_projection_health(
+    run_id: UUID,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    health = get_projection_health(db, run_id)
+    if health is None:
+        raise HTTPException(status_code=404, detail="event_store 中不存在该 Run 的事件")
+    return health
+
+
+@router.post("/runs/{run_id}/rebuild", response_model=RunOut)
+def post_rebuild_projection(
+    run_id: UUID,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(require_researcher),
+):
+    """研究员触发：按 event_store 全量重放，替换重建该 Run 的投影。"""
+    try:
+        return rebuild_and_persist_projection(db, run_id)
+    except DomainError as exc:
+        _handle_domain(exc)
